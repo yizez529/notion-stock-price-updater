@@ -14,7 +14,7 @@ if not DATABASE_ID:
     raise SystemExit("Missing env DATABASE_ID (check GitHub Secrets).")
 
 # =========================
-# 2) Notion API 配置
+# 2) Notion API 配置（新版必须 2025-09-03）
 # =========================
 NOTION_VERSION = "2025-09-03"
 HEADERS = {
@@ -24,32 +24,51 @@ HEADERS = {
 }
 
 # =========================
-# 3) 你的 Notion 数据库列名（必须和 Notion 完全一致）
-#    - ticker: 你的第一列 title，列名就是 "ticker"
-#    - 价格: Number
-#    - 价格更新时间: Date
+# 3) 你的 Notion 数据库列名（必须完全一致）
 # =========================
-TICKER_PROP_NAME = "ticker"
-PRICE_PROP_NAME = "价格"
-PRICE_TIME_PROP_NAME = "价格更新时间"
+TICKER_PROP_NAME = "ticker"      # title 列名
+PRICE_PROP_NAME = "价格"          # number
+PRICE_TIME_PROP_NAME = "价格更新时间"  # date
+
+
+def _fail(prefix: str, r: requests.Response):
+    print(prefix)
+    print("Status:", r.status_code)
+    print("Response:", r.text)
+    raise SystemExit(1)
 
 
 # =========================
-# 4) 查询 Notion 数据库所有 pages（带分页）
+# 4) 先 retrieve database，拿到 data_sources（新版关键）
 # =========================
-def notion_query_all_pages():
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+def notion_get_data_source_ids(database_id: str):
+    url = f"https://api.notion.com/v1/databases/{database_id}"
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    if r.status_code != 200:
+        _fail("Notion retrieve database failed.", r)
+
+    data = r.json()
+    data_sources = data.get("data_sources", [])
+    if not data_sources:
+        raise SystemExit("No data_sources found in this database. (unexpected)")
+
+    ids = [ds["id"] for ds in data_sources if ds.get("id")]
+    print(f"Found data_sources: {len(ids)}")
+    return ids
+
+
+# =========================
+# 5) Query a data source（替代旧的 database query）
+# =========================
+def notion_query_data_source_all_pages(data_source_id: str):
+    url = f"https://api.notion.com/v1/data_sources/{data_source_id}/query"
     pages = []
     payload = {}
 
     while True:
         r = requests.post(url, headers=HEADERS, json=payload, timeout=30)
-
         if r.status_code != 200:
-            print("Notion query failed.")
-            print("Status:", r.status_code)
-            print("Response:", r.text)  # 这里会打印 Notion 的详细错误 JSON
-            raise SystemExit(1)
+            _fail(f"Notion query data_source failed: {data_source_id}", r)
 
         data = r.json()
         pages.extend(data.get("results", []))
@@ -62,28 +81,39 @@ def notion_query_all_pages():
     return pages
 
 
+def notion_query_all_pages():
+    # 1) 发现 data_source_ids
+    data_source_ids = notion_get_data_source_ids(DATABASE_ID)
+
+    # 2) 把所有 data source 的页面合并（你的库里可能有多个数据源）
+    all_pages = []
+    for dsid in data_source_ids:
+        ds_pages = notion_query_data_source_all_pages(dsid)
+        print(f"Data source {dsid}: pages={len(ds_pages)}")
+        all_pages.extend(ds_pages)
+
+    return all_pages
+
+
 # =========================
-# 5) 从每个 page 读取 ticker
-#    支持：Title / Rich text / Select
+# 6) 从每个 page 读取 ticker（支持 Title/Rich_text/Select）
 # =========================
 def get_ticker_from_page(page):
-    prop = page["properties"].get(TICKER_PROP_NAME)
+    props = page.get("properties", {})
+    prop = props.get(TICKER_PROP_NAME)
     if not prop:
         return None
 
     t = prop.get("type")
 
-    # Title 类型（你的 ticker 第一列一般是 title）
     if t == "title":
         arr = prop.get("title", [])
         return arr[0]["plain_text"].strip() if arr else None
 
-    # Rich text 类型
     if t == "rich_text":
         arr = prop.get("rich_text", [])
         return arr[0]["plain_text"].strip() if arr else None
 
-    # Select 类型
     if t == "select":
         sel = prop.get("select")
         return sel["name"].strip() if sel else None
@@ -92,8 +122,7 @@ def get_ticker_from_page(page):
 
 
 # =========================
-# 6) 免费行情源：Stooq（无需 API Key）
-#    美股符号格式：aapl.us
+# 7) 免费行情源：Stooq（无需 API Key）
 # =========================
 def stooq_symbol(ticker: str) -> str:
     t = ticker.strip().lower()
@@ -103,12 +132,6 @@ def stooq_symbol(ticker: str) -> str:
 
 
 def fetch_latest_close_from_stooq(ticker: str):
-    """
-    Stooq CSV:
-      https://stooq.com/q/d/l/?s=aapl.us&i=d
-    返回日线数据：Date,Open,High,Low,Close,Volume
-    我们取最后一行作为最近交易日 close。
-    """
     sym = stooq_symbol(ticker)
     url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
 
@@ -127,8 +150,8 @@ def fetch_latest_close_from_stooq(ticker: str):
         print(f"Stooq bad format: {ticker}")
         return None
 
-    date_str = last[0]      # YYYY-MM-DD
-    close_str = last[4]     # Close
+    date_str = last[0]
+    close_str = last[4]
 
     if close_str in ("", "nan", "NaN"):
         print(f"Stooq close is empty: {ticker}")
@@ -142,7 +165,7 @@ def fetch_latest_close_from_stooq(ticker: str):
 
 
 # =========================
-# 7) 更新 Notion page：写入 价格 / 价格更新时间
+# 8) 更新 Notion page：写入 价格 / 价格更新时间
 # =========================
 def notion_update_page(page_id: str, close_price: float, close_date: str):
     url = f"https://api.notion.com/v1/pages/{page_id}"
@@ -154,21 +177,14 @@ def notion_update_page(page_id: str, close_price: float, close_date: str):
     }
 
     r = requests.patch(url, headers=HEADERS, json=payload, timeout=30)
-
     if r.status_code != 200:
-        print(f"Notion update failed for page {page_id}")
-        print("Status:", r.status_code)
-        print("Response:", r.text)
-        raise SystemExit(1)
+        _fail(f"Notion update failed for page {page_id}", r)
 
 
-# =========================
-# 8) 主流程：读 ticker → 拉 close → 写回 Notion
-# =========================
 def main():
-    print("Start: query notion database pages...")
+    print("Start: query notion pages from data sources...")
     pages = notion_query_all_pages()
-    print(f"Found pages: {len(pages)}")
+    print(f"Total pages fetched: {len(pages)}")
 
     ok, fail, skip = 0, 0, 0
 
@@ -177,13 +193,11 @@ def main():
         ticker = get_ticker_from_page(p)
 
         if not ticker:
-            print(f"Skip (no ticker): {page_id}")
             skip += 1
             continue
 
         res = fetch_latest_close_from_stooq(ticker)
         if not res:
-            print(f"Fail fetch: {ticker}")
             fail += 1
             continue
 
@@ -193,7 +207,7 @@ def main():
             notion_update_page(page_id, close_price, close_date)
             print(f"OK {ticker} close={close_price} date={close_date}")
             ok += 1
-            time.sleep(0.35)  # 轻微延迟，避免 Notion 限速
+            time.sleep(0.35)
         except Exception as e:
             print(f"ERROR update {ticker}: {e}")
             fail += 1
