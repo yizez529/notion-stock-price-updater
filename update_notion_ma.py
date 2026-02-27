@@ -20,7 +20,7 @@ HEADERS = {
 }
 
 # ========= Notion 字段名（与你的数据库完全一致）=========
-TICKER_PROP = "Ticker"
+TICKER_PROP = "ticker"
 PRICE_TIME_PROP = "价格更新时间"
 PRICE_PROP = "价格"
 MA20_PROP = "MA20"
