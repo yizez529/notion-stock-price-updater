@@ -1,0 +1,22 @@
+name: Update Notion Close Price
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 22:30 跑一次（对应中国时间次日 06:30 左右）
+    - cron: "30 22 * * 1-5"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Run updater
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+        run: python update_notion_close.py
