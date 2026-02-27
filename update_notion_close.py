@@ -16,7 +16,7 @@ if not DATABASE_ID:
 # =========================
 # 2) Notion API 配置
 # =========================
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = "2025-09-03"
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
