@@ -1,0 +1,48 @@
+name: Update Notion Stock Prices
+
+on:
+  schedule:
+    # 每天 UTC 22:00 = 北京时间 06:00 = 美东 18:00（收盘后2小时）
+    - cron: '0 22 * * 1-5'  # 周一到周五
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check scripts importable
+        run: |
+          python -c "
+          import requests, yfinance, numpy
+          print('All packages OK')
+          "
+      - name: Check env vars present
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+        run: |
+          test -n "$NOTION_TOKEN" || (echo "::error::NOTION_TOKEN missing in Secrets"; exit 1)
+          test -n "$DATABASE_ID" || (echo "::error::DATABASE_ID missing in Secrets"; exit 1)
+          echo "All secrets present"
+
+  update:
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run stock updater
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+        run: python scripts/update_notion.py
