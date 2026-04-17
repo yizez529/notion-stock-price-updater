@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DATABASE_ID = os.environ["DATABASE_ID"]
 NOTION_API = "https://api.notion.com/v1"
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = "2025-09-03"  # 新版 API，支持 data_sources
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": NOTION_VERSION,
@@ -28,28 +28,55 @@ HEADERS = {
 PULLBACK_THRESHOLD = 0.02  # 2%
 
 
-# ── Notion 分页读取所有 ticker ──────────────────────────
+# ── Notion：获取 data_source_ids ──────────────────────
+def get_data_source_ids() -> list[str]:
+    """从数据库元数据中获取 data_source IDs（新版 Notion API 必需）"""
+    resp = requests.get(
+        f"{NOTION_API}/databases/{DATABASE_ID}",
+        headers=HEADERS,
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        print(f"[FATAL] Notion retrieve database failed: {resp.status_code}")
+        print(resp.text)
+        sys.exit(1)
+
+    data = resp.json()
+    data_sources = data.get("data_sources", [])
+    if not data_sources:
+        print("[FATAL] No data_sources found in database. Is DATABASE_ID correct?")
+        sys.exit(1)
+
+    ids = [ds["id"] for ds in data_sources if ds.get("id")]
+    print(f"[Notion] Found {len(ids)} data source(s)")
+    return ids
+
+
+# ── Notion：分页读取所有 ticker ──────────────────────────
 def fetch_all_pages() -> list[dict]:
-    """分页读取 Notion 数据库所有页面（每次最多 100 条）"""
-    pages = []
-    start_cursor = None
-    while True:
-        body = {"page_size": 100}
-        if start_cursor:
-            body["start_cursor"] = start_cursor
-        resp = requests.post(
-            f"{NOTION_API}/databases/{DATABASE_ID}/query",
-            headers=HEADERS,
-            json=body,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        pages.extend(data.get("results", []))
-        if not data.get("has_more"):
-            break
-        start_cursor = data.get("next_cursor")
-    print(f"[Notion] 共读取 {len(pages)} 条记录")
-    return pages
+    """通过 data_sources 端点分页读取所有页面"""
+    ds_ids = get_data_source_ids()
+    all_pages = []
+
+    for dsid in ds_ids:
+        url = f"{NOTION_API}/data_sources/{dsid}/query"
+        payload = {}
+        while True:
+            resp = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+            if resp.status_code != 200:
+                print(f"[ERROR] Query data_source {dsid} failed: {resp.status_code}")
+                print(resp.text)
+                break
+            data = resp.json()
+            all_pages.extend(data.get("results", []))
+            if data.get("has_more"):
+                payload["start_cursor"] = data.get("next_cursor")
+            else:
+                break
+        print(f"  data_source {dsid[:8]}...: {len(all_pages)} pages")
+
+    print(f"[Notion] 共读取 {len(all_pages)} 条记录")
+    return all_pages
 
 
 def extract_ticker(page: dict) -> str | None:
