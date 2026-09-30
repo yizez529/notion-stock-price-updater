@@ -22,6 +22,8 @@ jobs:
           import requests, yfinance, numpy
           print('All packages OK')
           "
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
       - name: Check env vars present
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
