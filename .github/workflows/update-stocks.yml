@@ -1,6 +1,7 @@
 name: Update Notion Stock Prices
 
 on:
+  pull_request:
   schedule:
     # 每天 UTC 22:00 = 北京时间 06:00 = 美东 18:00（收盘后2小时）
     - cron: '0 22 * * 1-5'  # 周一到周五
@@ -22,7 +23,10 @@ jobs:
           import requests, yfinance, numpy
           print('All packages OK')
           "
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v
       - name: Check env vars present
+        if: github.event_name != 'pull_request'
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
@@ -33,6 +37,7 @@ jobs:
 
   update:
     needs: smoke-test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,4 +50,4 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DATABASE_ID: ${{ secrets.DATABASE_ID }}
-        run: python scripts/update_notion.py
+        run: python -u scripts/update_notion.py
