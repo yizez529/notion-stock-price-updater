@@ -20,6 +20,8 @@ import time
 import requests
 import yfinance as yf
 import numpy as np
+import pandas as pd
+import math
 from datetime import datetime, timezone
 
 # ── 配置 ──────────────────────────────────────────────
@@ -53,6 +55,15 @@ FETCH_RETRY_BACKOFF_SEC = 3.0
 
 # 记录已经警告过"数据库缺少此字段"的字段名，避免每个 ticker 都重复刷屏
 _WARNED_MISSING_FIELDS: set[str] = set()
+
+
+def finite_number(value) -> float | None:
+    """Reject NaN, Infinity, and invalid numeric values before any Notion write."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 # ── Notion：获取 data_source_ids ──────────────────────
@@ -191,37 +202,53 @@ def fetch_stock_data(ticker: str) -> dict | None:
         return None
 
     try:
+        # Yahoo data may contain non-finite quotes despite having enough rows.
+        # In particular, never replace a bad latest close with a stale close.
+        hist = hist.copy()
+        if "Close" not in hist.columns:
+            raise ValueError("行情缺少 Close 列")
+        for col in ("Close", "High", "Low", "Volume"):
+            if col in hist.columns:
+                hist[col] = pd.to_numeric(hist[col], errors="coerce").replace(
+                    [np.inf, -np.inf], np.nan
+                )
+        latest_close = finite_number(hist["Close"].iloc[-1])
+        if latest_close is None or latest_close <= 0:
+            raise ValueError("最新收盘价无效（NaN/Infinity/非正数），拒绝覆盖 Notion 旧价格")
+        hist = hist.loc[hist["Close"].notna() & (hist["Close"] > 0)].copy()
+        if len(hist) < 5:
+            raise ValueError("清洗后有效行情少于 5 条")
         close = hist["Close"]
         volume = hist["Volume"] if "Volume" in hist.columns else None
-        latest_close = float(close.iloc[-1])
         data_date = hist.index[-1].strftime("%Y-%m-%d")
 
         ma20_series = close.rolling(20).mean()
         ma50_series = close.rolling(50).mean()
         ma200_series = close.rolling(200).mean()
 
-        ma20 = float(ma20_series.iloc[-1]) if len(close) >= 20 else None
-        ma50 = float(ma50_series.iloc[-1]) if len(close) >= 50 else None
-        ma200 = float(ma200_series.iloc[-1]) if len(close) >= 200 else None
+        ma20 = finite_number(ma20_series.iloc[-1]) if len(close) >= 20 else None
+        ma50 = finite_number(ma50_series.iloc[-1]) if len(close) >= 50 else None
+        ma200 = finite_number(ma200_series.iloc[-1]) if len(close) >= 200 else None
 
         # ATR 动态回踩阈值（相对价格的百分比），有上下限保护
         pullback_threshold = PULLBACK_THRESHOLD_FALLBACK
-        atr_series = compute_atr(hist)
-        atr_valid = atr_series.dropna()
-        if len(atr_valid) > 0 and latest_close:
-            atr_pct = float(atr_valid.iloc[-1]) / latest_close
-            pullback_threshold = min(
-                max(atr_pct * ATR_PULLBACK_MULTIPLIER, MIN_PULLBACK_THRESHOLD),
-                MAX_PULLBACK_THRESHOLD,
-            )
+        if {"High", "Low"}.issubset(hist.columns):
+            atr_series = compute_atr(hist)
+            latest_atr = finite_number(atr_series.iloc[-1])
+            if latest_atr is not None and latest_atr >= 0:
+                atr_pct = latest_atr / latest_close
+                pullback_threshold = min(
+                    max(atr_pct * ATR_PULLBACK_MULTIPLIER, MIN_PULLBACK_THRESHOLD),
+                    MAX_PULLBACK_THRESHOLD,
+                )
 
         # 量能：相对前20日均量（不含当日）的倍数
         vol_ratio = None
         if volume is not None and len(volume) >= 21:
-            avg_vol_prior = float(volume.rolling(20).mean().shift(1).iloc[-1])
-            latest_vol = float(volume.iloc[-1])
-            if avg_vol_prior and avg_vol_prior > 0:
-                vol_ratio = latest_vol / avg_vol_prior
+            avg_vol_prior = finite_number(volume.rolling(20).mean().shift(1).iloc[-1])
+            latest_vol = finite_number(volume.iloc[-1])
+            if avg_vol_prior is not None and avg_vol_prior > 0 and latest_vol is not None and latest_vol >= 0:
+                vol_ratio = finite_number(latest_vol / avg_vol_prior)
 
         return {
             "close": latest_close,
@@ -331,6 +358,15 @@ def compute_stage(data: dict) -> str:
 def update_page(page_id: str, ticker: str, data: dict, schema_props: set[str] | None = None):
     """将计算结果写回 Notion page。若提供 schema_props，会先过滤掉数据库里
     不存在的字段，避免因为单个字段缺失导致整条记录更新失败。"""
+    # Validate the final Notion boundary independently of the data provider.
+    data = dict(data)
+    data["close"] = finite_number(data.get("close"))
+    if data["close"] is None or data["close"] <= 0:
+        print(f"  [FAIL] {ticker}: 无效收盘价，未写入 Notion")
+        return False
+    for name in ("ma20", "ma50", "ma200", "vol_ratio"):
+        data[name] = finite_number(data.get(name))
+    data["pullback_threshold"] = finite_number(data.get("pullback_threshold")) or PULLBACK_THRESHOLD_FALLBACK
     triggers = compute_triggers(data)
     stage = compute_stage(data)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -361,19 +397,30 @@ def update_page(page_id: str, ticker: str, data: dict, schema_props: set[str] | 
     else:
         properties = desired
 
-    resp = requests.patch(
-        f"{NOTION_API}/pages/{page_id}",
-        headers=HEADERS,
-        json={"properties": properties},
-    )
+    try:
+        # Prevent the requests library from rejecting a NaN at serialization time.
+        json.dumps({"properties": properties}, allow_nan=False)
+        resp = requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
+            headers=HEADERS,
+            json={"properties": properties},
+            timeout=30,
+        )
+    except (ValueError, TypeError, requests.RequestException) as exc:
+        print(f"  [FAIL] {ticker}: Notion 请求/数据校验失败 - {exc}")
+        return False
 
     if resp.status_code == 200:
         print(f"  [OK] {ticker}: 价格={data['close']:.2f}, 阶段={stage}, 信号={triggers}")
-    else:
-        err = resp.json()
-        print(f"  [FAIL] {ticker}: Notion API {resp.status_code} - {json.dumps(err, ensure_ascii=False)}")
-        if resp.status_code == 400:
-            print("  [DEBUG] 请检查 Notion 数据库是否包含以下字段：价格、MA20、MA50、MA200、阶段、触发信号、价格更新时间、数据日期")
+        return True
+    try:
+        error_detail = json.dumps(resp.json(), ensure_ascii=False)
+    except ValueError:
+        error_detail = resp.text[:500]
+    print(f"  [FAIL] {ticker}: Notion API {resp.status_code} - {error_detail}")
+    if resp.status_code == 400:
+        print("  [DEBUG] 请检查 Notion 数据库是否包含以下字段：价格、MA20、MA50、MA200、阶段、触发信号、价格更新时间、数据日期")
+    return False
 
 
 # ── 主流程 ────────────────────────────────────────────
@@ -405,17 +452,19 @@ def main():
             skip += 1
             continue
 
-        print(f"\n>> 处理 {ticker} ...")
-        data = fetch_stock_data(ticker)
-        if not data:
+        print(f"\n>> 处理 {ticker} ...", flush=True)
+        try:
+            data = fetch_stock_data(ticker)
+            if data and update_page(page["id"], ticker, data, schema_props):
+                success += 1
+            else:
+                fail += 1
+        except Exception as exc:
+            # Failure of one ticker must not block the rest of the portfolio.
+            print(f"  [FAIL] {ticker}: 未预期异常 - {type(exc).__name__}: {exc}")
             fail += 1
-            continue
-
-        update_page(page["id"], ticker, data, schema_props)
-        success += 1
-
-        # 礼貌间隔，避免触发 Notion rate limit
-        time.sleep(0.4)
+        finally:
+            time.sleep(0.4)
 
     print("\n" + "=" * 60)
     print(f"完成: 成功={success}, 失败={fail}, 跳过={skip}, 总计={len(pages)}")
