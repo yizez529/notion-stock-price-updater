@@ -53,6 +53,15 @@ class UpdaterRegressionTests(unittest.TestCase):
         with self.yahoo(h):
             self.assertIsNone(updater.fetch_stock_data("USAR"))
 
+    def test_repair_retries_same_session_without_using_a_stale_quote(self):
+        good = history()
+        invalid = good.copy()
+        invalid.iloc[-1, invalid.columns.get_loc("Close")] = np.nan
+        provider = Mock()
+        provider.history.side_effect = [invalid, good]
+        with patch.object(updater.yf, "Ticker", return_value=provider):
+            self.assertEqual(updater.fetch_stock_data("GS")["close"], 150.0)
+
     def test_infinite_latest_close_is_rejected(self):
         h = history()
         h.iloc[-1, h.columns.get_loc("Close")] = np.inf
