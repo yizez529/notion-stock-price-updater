@@ -189,6 +189,21 @@ def fetch_stock_data(ticker: str) -> dict | None:
             h = tk.history(period="1y")  # ~252 交易日，够算 MA200
             if h.empty or len(h) < 5:
                 raise ValueError(f"历史数据不足（{len(h)} 条）")
+            close = finite_number(h["Close"].iloc[-1]) if "Close" in h else None
+            if close is None or close <= 0:
+                if attempt < FETCH_RETRIES:
+                    # Retry the daily series in repair mode before accepting any price.
+                    repaired = tk.history(period="1y", repair=True, raise_errors=True)
+                    if not repaired.empty and "Close" in repaired:
+                        repaired_close = finite_number(repaired["Close"].iloc[-1])
+                        if (
+                            repaired.index[-1].date() == h.index[-1].date()
+                            and repaired_close is not None and repaired_close > 0
+                        ):
+                            hist = repaired
+                            break
+                    raise ValueError("最新收盘价无效；修复结果未确认同一交易日")
+                raise ValueError("最新收盘价无效；保留 Notion 已有数据")
             hist = h
             break
         except Exception as e:
