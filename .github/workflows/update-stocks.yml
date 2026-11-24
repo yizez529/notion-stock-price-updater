@@ -2,10 +2,20 @@ name: Update Notion Stock Prices
 
 on:
   pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'requirements.txt'
+      - '.github/workflows/update-stocks.yml'
   schedule:
-    # 每天 UTC 22:00 = 北京时间 06:00 = 美东 18:00（收盘后2小时）
-    - cron: '0 22 * * 1-5'  # 周一到周五
+    # UTC Tue-Sat 00:17 = 北京时间周二至周六 08:17；避开整点拥堵
+    - cron: '17 0 * * 2-6'
   workflow_dispatch:  # 手动触发
+
+concurrency:
+  group: stock-updater-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
 
 jobs:
   smoke-test:
@@ -20,7 +30,7 @@ jobs:
       - name: Check scripts importable
         run: |
           python -c "
-          import requests, yfinance, numpy
+          import requests, yfinance, numpy, sklearn
           print('All packages OK')
           "
       - name: Run offline regression tests
