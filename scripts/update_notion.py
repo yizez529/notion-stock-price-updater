@@ -426,7 +426,7 @@ def update_page(page_id: str, ticker: str, data: dict, schema_props: set[str] | 
         return False
 
     if resp.status_code == 200:
-        print(f"  [OK] {ticker}: 价格={data['close']:.2f}, 阶段={stage}, 信号={triggers}")
+        print(f"  [OK] {ticker}: 价格={data['close']:.2f}, 数据日期={data['data_date']}, 阶段={stage}, 信号={triggers}")
         return True
     try:
         error_detail = json.dumps(resp.json(), ensure_ascii=False)
